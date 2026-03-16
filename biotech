@@ -2240,7 +2240,7 @@
                 }
             },
 
-            // Save all data to Firebase
+            // Save all data to Firebase (except audit logs – they are pushed separately)
             async save() {
                 try {
                     await Promise.all([
@@ -2250,7 +2250,6 @@
                         examinationsRef.set(this.examinations),
                         labTestsRef.set(this.labTests),
                         prescriptionsRef.set(this.prescriptions),
-                        auditLogsRef.set(this.auditLogs),
                         counterRef.set(this.patientCounter)
                     ]);
                 } catch (error) {
@@ -2267,6 +2266,29 @@
                 this.patientCounter = result.snapshot.val();
                 const year = new Date().getFullYear();
                 return `PBT-${year}-${String(this.patientCounter).padStart(4, '0')}`;
+            },
+
+            // Login method (searches local users array)
+            login(username, password) {
+                const user = this.users.find(u => u.username === username && u.password === password && u.active === true);
+                if (user) {
+                    this.currentUser = user;
+                    user.lastLogin = new Date().toISOString();
+                    this.logAction('Login', `User ${username} logged in`);
+                    this.save();  // update lastLogin in Firebase
+                    localStorage.setItem('pbt_user', JSON.stringify(user));
+                    return true;
+                }
+                return false;
+            },
+
+            // Logout method
+            logout() {
+                if (this.currentUser) {
+                    this.logAction('Logout', `User ${this.currentUser.username} logged out`);
+                    this.currentUser = null;
+                    localStorage.removeItem('pbt_user');
+                }
             },
 
             createPatientFile(patientId, patientData) {
@@ -2472,6 +2494,7 @@
                 return age;
             },
 
+            // Modified logAction to push each log individually (prevents overwrites)
             logAction(action, details) {
                 const log = {
                     id: Date.now(),
@@ -2481,9 +2504,11 @@
                     action: action,
                     details: details
                 };
+                // Keep local array for UI display
                 this.auditLogs.unshift(log);
                 if (this.auditLogs.length > 500) this.auditLogs.pop();
-                this.save();
+                // Push to Firebase (new log entry, not overwriting whole list)
+                auditLogsRef.push(log).catch(err => console.error('Audit log push failed:', err));
             }
         };
 
@@ -2493,7 +2518,7 @@
 
             // Populate country dropdown
             const countrySelect = document.getElementById('pat-country');
-            if (countrySelect) {
+            if (countrySelect && countrySelect.options.length === 0) {
                 const countries = [
                     "Afghanistan", "Albania", "Algeria", "Andorra", "Angola", "Antigua and Barbuda", "Argentina", "Armenia", "Australia", "Austria", "Azerbaijan",
                     "Bahamas", "Bahrain", "Bangladesh", "Barbados", "Belarus", "Belgium", "Belize", "Benin", "Bhutan", "Bolivia", "Bosnia and Herzegovina", "Botswana", "Brazil", "Brunei", "Bulgaria", "Burkina Faso", "Burundi",
@@ -2517,30 +2542,21 @@
             }
         }
 
-        // ==================== AUTHENTICATION ====================
+        // ==================== AUTHENTICATION (using new login method) ====================
         document.getElementById('login-form').addEventListener('submit', function(e) {
             e.preventDefault();
             const username = document.getElementById('login-username').value;
             const password = document.getElementById('login-password').value;
             
-            const user = Storage.users.find(u => 
-                u.username === username && 
-                u.password === password && 
-                u.active === true
-            );
+            const success = Storage.login(username, password);
             
-            if (user) {
-                Storage.currentUser = user;
-                user.lastLogin = new Date().toISOString();
-                Storage.logAction('Login', `User ${username} logged in`);
-                Storage.save();
-                
+            if (success) {
                 document.getElementById('login-view').style.display = 'none';
                 document.getElementById('app-view').style.display = 'block';
                 
-                document.getElementById('sidebar-user-name').textContent = user.fullName;
-                document.getElementById('sidebar-user-role').textContent = formatRole(user.role);
-                document.getElementById('user-avatar').textContent = user.fullName.charAt(0).toUpperCase();
+                document.getElementById('sidebar-user-name').textContent = Storage.currentUser.fullName;
+                document.getElementById('sidebar-user-role').textContent = formatRole(Storage.currentUser.role);
+                document.getElementById('user-avatar').textContent = Storage.currentUser.fullName.charAt(0).toUpperCase();
                 
                 setupNavigation();
                 loadDashboard();
@@ -2564,15 +2580,14 @@
         }
 
         function logout() {
-            Storage.logAction('Logout', `User ${Storage.currentUser.username} logged out`);
-            Storage.currentUser = null;
+            Storage.logout();
             document.getElementById('app-view').style.display = 'none';
             document.getElementById('login-view').style.display = 'flex';
             document.getElementById('login-form').reset();
             showNotification('Logged out successfully', 'info');
         }
 
-        // ==================== NAVIGATION ====================
+        // ==================== NAVIGATION (unchanged) ====================
         function setupNavigation() {
             const nav = document.getElementById('main-navigation');
             const role = Storage.currentUser.role;
@@ -4926,15 +4941,41 @@
                 note: 'Removed from queue via right-click'
             });
             // Do NOT save transfer procedure
-            Storage.logAction('Patient Raemoved from Queue', `Patient ${patient.patientNo} removed from waiting queue`);
+            Storage.logAction('Patient Removed from Queue', `Patient ${patient.patientNo} removed from waiting queue`);
             Storage.save();
             filterPatientList();
             filterAllPatients();
             showNotification(`Patient ${patient.name} removed from queue`, 'info');
         }
 
-        // ==================== INITIALIZATION ====================
-        initSystem();
+        // ==================== INITIALIZATION with window.onload ====================
+        window.onload = async () => {
+            await initSystem();  // load data from Firebase
+
+            // Check if already logged in via localStorage
+            const saved = localStorage.getItem('pbt_user');
+            if (saved) {
+                try {
+                    const user = JSON.parse(saved);
+                    // Verify user still exists and is active
+                    const found = Storage.users.find(u => u.id === user.id && u.active === true);
+                    if (found) {
+                        Storage.currentUser = found;
+                        document.getElementById('login-view').style.display = 'none';
+                        document.getElementById('app-view').style.display = 'block';
+                        document.getElementById('sidebar-user-name').textContent = found.fullName;
+                        document.getElementById('sidebar-user-role').textContent = formatRole(found.role);
+                        document.getElementById('user-avatar').textContent = found.fullName.charAt(0).toUpperCase();
+                        setupNavigation();
+                        loadDashboard();
+                    } else {
+                        localStorage.removeItem('pbt_user');
+                    }
+                } catch (e) {
+                    localStorage.removeItem('pbt_user');
+                }
+            }
+        };
 
         setInterval(() => {
             const count = getNotificationCount();
